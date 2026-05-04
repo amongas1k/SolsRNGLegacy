@@ -24,6 +24,7 @@ local TELEPORT_COOLDOWN = 5    -- seconds between teleports
 local lastTeleportTime = 0
 
 local processedItems = {}
+local itemTasks = {}           -- item -> true (prevents duplicate processing)
 
 local autoCollectEnabled   = false
 local teleportEnabled      = false
@@ -87,115 +88,142 @@ local function updateCounter(name)
     end
 end
 
--- ── Scheduled teleport + auto collect (combined) ──
+-- ── Single‑task scheduler ──────────
 local function scheduleTeleport(item)
-    -- Wait the spawn delay first
-    local delay = SPAWN_DELAY
-    if delay > 0 then
-        task.wait(delay)
-    end
+    -- Already being processed? Skip.
+    if itemTasks[item] then return end
+    itemTasks[item] = true
 
-    -- After delay, check if item still valid and not collected
-    if not item:IsDescendantOf(Workspace) then return end
-    if processedItems[item] then return end
-
-    -- Check teleport cooldown (only for forward teleport)
-    local allowForwardTeleport = teleportEnabled and (tick() - lastTeleportTime >= TELEPORT_COOLDOWN)
-
-    -- If neither teleport nor auto-collect are enabled, stop
-    if not allowForwardTeleport and not autoCollectEnabled then return end
-
-    local prompt = getPrompt(item)
-    if not prompt or not prompt.Enabled then return end
-
-    local promptPart = getPromptPart(prompt) or getPrimaryPart(item)
-    if not promptPart then return end
-
-    local character = player.Character
-    if not character then return end
-    local rootPart = character:FindFirstChild("HumanoidRootPart")
-    if not rootPart then return end
-
-    local originalCFrame = rootPart.CFrame
-    local didTeleport = false
-
-    -- Forward teleport only if cooldown allows
-    if allowForwardTeleport then
-        local targetCFrame = promptPart.CFrame + Vector3.new(0, TELEPORT_HEIGHT, 0)
-        pcall(function() character:PivotTo(targetCFrame) end)
-        didTeleport = true
-        lastTeleportTime = tick()   -- start cooldown timer now
-        task.wait(0.25)
-    end
-
-    -- Auto collect (always runs if enabled and not already collected)
-    local collected = false
-    if autoCollectEnabled and not processedItems[item] then
-        local originalLOS = prompt.RequiresLineOfSight
-        prompt.RequiresLineOfSight = false
-
-        local triggered = false
-        local conn
-        pcall(function()
-            conn = prompt.Triggered:Connect(function()
-                triggered = true
-                if conn then conn:Disconnect() end
-            end)
-        end)
-        pcall(function() prompt:InputHoldBegin() end)
-
-        local start = tick()
-        while not triggered and tick() - start < 3 do
-            RunService.Heartbeat:Wait()
+    task.spawn(function()
+        -- Wait the spawn delay first
+        if SPAWN_DELAY > 0 then
+            task.wait(SPAWN_DELAY)
         end
 
-        if triggered then
-            processedItems[item] = true
-            collected = true
+        -- After delay, check if item still valid and not collected
+        if not item:IsDescendantOf(Workspace) then
+            itemTasks[item] = nil
+            return
+        end
+        if processedItems[item] then
+            itemTasks[item] = nil
+            return
+        end
 
-            -- Increment counter
-            local name = item.Name
-            if collectedCounts[name] ~= nil then
-                collectedCounts[name] = collectedCounts[name] + 1
-                updateCounter(name)
+        -- Check teleport cooldown (only for forward teleport)
+        local allowForwardTeleport = teleportEnabled and (tick() - lastTeleportTime >= TELEPORT_COOLDOWN)
+
+        -- If neither teleport nor auto-collect are enabled, stop
+        if not allowForwardTeleport and not autoCollectEnabled then
+            itemTasks[item] = nil
+            return
+        end
+
+        local prompt = getPrompt(item)
+        if not prompt or not prompt.Enabled then
+            itemTasks[item] = nil
+            return
+        end
+
+        local promptPart = getPromptPart(prompt) or getPrimaryPart(item)
+        if not promptPart then
+            itemTasks[item] = nil
+            return
+        end
+
+        local character = player.Character
+        if not character then
+            itemTasks[item] = nil
+            return
+        end
+        local rootPart = character:FindFirstChild("HumanoidRootPart")
+        if not rootPart then
+            itemTasks[item] = nil
+            return
+        end
+
+        local originalCFrame = rootPart.CFrame
+        local didTeleport = false
+
+        -- Forward teleport only if cooldown allows
+        if allowForwardTeleport then
+            local targetCFrame = promptPart.CFrame + Vector3.new(0, TELEPORT_HEIGHT, 0)
+            pcall(function() character:PivotTo(targetCFrame) end)
+            didTeleport = true
+            lastTeleportTime = tick()
+            task.wait(0.25)
+        end
+
+        -- Auto collect
+        if autoCollectEnabled and not processedItems[item] then
+            local originalLOS = prompt.RequiresLineOfSight
+            prompt.RequiresLineOfSight = false
+
+            local triggered = false
+            local conn
+            pcall(function()
+                conn = prompt.Triggered:Connect(function()
+                    triggered = true
+                    if conn then conn:Disconnect() end
+                end)
+            end)
+            pcall(function() prompt:InputHoldBegin() end)
+
+            local start = tick()
+            while not triggered and tick() - start < 3 do
+                RunService.Heartbeat:Wait()
             end
 
-            -- Respawn after collect
-            if respawnAfterCollect then
-                task.wait(0.2)
-                if player.Character then
-                    pcall(function() player:LoadCharacter() end)
+            if triggered then
+                processedItems[item] = true
+
+                -- Increment counter
+                local name = item.Name
+                if collectedCounts[name] ~= nil then
+                    collectedCounts[name] = collectedCounts[name] + 1
+                    updateCounter(name)
+                end
+
+                -- Respawn after collect
+                if respawnAfterCollect then
+                    task.wait(0.2)
+                    if player.Character then
+                        pcall(function() player:LoadCharacter() end)
+                    end
                 end
             end
+
+            if conn then pcall(function() conn:Disconnect() end) end
+            prompt.RequiresLineOfSight = originalLOS
         end
 
-        if conn then pcall(function() conn:Disconnect() end) end
-        prompt.RequiresLineOfSight = originalLOS
-    end
+        -- Return to previous position (only if we teleported forward)
+        if didTeleport then
+            pcall(function() character:PivotTo(originalCFrame) end)
+        end
 
-    -- Return to previous position (only if we teleported forward)
-    if didTeleport then
-        pcall(function() character:PivotTo(originalCFrame) end)
-    end
+        -- Release the lock
+        itemTasks[item] = nil
+    end)
 end
 
 -- ── Detection ──────────────────────
 local DROPPED_ITEMS_FOLDER = Workspace:WaitForChild("DroppedItems")
 
--- When a child is added, schedule it for later collection
+-- When a child is added, schedule it (only if has prompt)
 DROPPED_ITEMS_FOLDER.ChildAdded:Connect(function(child)
     if getPrompt(child) and not processedItems[child] then
-        task.spawn(scheduleTeleport, child)
+        scheduleTeleport(child)
     end
 end)
 
--- Fallback scanner (handles edge cases, respects same logic)
+-- Fallback scanner (still respects the lock)
 task.spawn(function()
     while true do
         task.wait(0.5)
         for _, child in ipairs(DROPPED_ITEMS_FOLDER:GetChildren()) do
             if getPrompt(child) and not processedItems[child] then
-                task.spawn(scheduleTeleport, child)
+                scheduleTeleport(child)
             end
         end
     end
@@ -354,6 +382,7 @@ end
 
 DROPPED_ITEMS_FOLDER.ChildRemoved:Connect(function(child)
     removeESP(child)
+    itemTasks[child] = nil   -- clean up lock
 end)
 
 -- ── UI Tabs ────────────────────────
