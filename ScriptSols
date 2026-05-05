@@ -19,16 +19,16 @@ local Window = OrionLib:MakeWindow({
 
 -- ── State ──────────────────────────
 local TELEPORT_HEIGHT = 2.5
-local SPAWN_DELAY = 1          -- seconds after item spawn
-local TELEPORT_COOLDOWN = 5    -- seconds between teleports
+local HORIZONTAL_OFFSET = 0
+local SPAWN_DELAY = 1
+local TELEPORT_COOLDOWN = 5
 local lastTeleportTime = 0
 
 local processedItems = {}
-local itemTasks = {}           -- item -> true (prevents duplicate processing)
+local itemTasks = {}
 
 local autoCollectEnabled   = false
 local teleportEnabled      = false
-local respawnAfterCollect  = false
 local espEnabled           = false
 local showItemName         = false
 local espOutlineColor      = Color3.fromRGB(255,255,255)
@@ -41,7 +41,6 @@ for _, name in ipairs(trackedItems) do
     collectedCounts[name] = 0
 end
 
--- Orion label references
 local counterLabels = {}
 
 -- ── Utilities ──────────────────────
@@ -80,7 +79,6 @@ local function toColor3(val)
     return Color3.new(1,1,1)
 end
 
--- ── Counter update ─────────────────
 local function updateCounter(name)
     local lbl = counterLabels[name]
     if lbl then
@@ -88,73 +86,52 @@ local function updateCounter(name)
     end
 end
 
--- ── Single‑task scheduler ──────────
+-- ── Scheduler ──────────────────────
 local function scheduleTeleport(item)
-    -- Already being processed? Skip.
     if itemTasks[item] then return end
     itemTasks[item] = true
 
     task.spawn(function()
-        -- Wait the spawn delay first
-        if SPAWN_DELAY > 0 then
-            task.wait(SPAWN_DELAY)
-        end
+        if SPAWN_DELAY > 0 then task.wait(SPAWN_DELAY) end
 
-        -- After delay, check if item still valid and not collected
         if not item:IsDescendantOf(Workspace) then
-            itemTasks[item] = nil
-            return
+            itemTasks[item] = nil; return
         end
         if processedItems[item] then
-            itemTasks[item] = nil
-            return
+            itemTasks[item] = nil; return
         end
 
-        -- Check teleport cooldown (only for forward teleport)
         local allowForwardTeleport = teleportEnabled and (tick() - lastTeleportTime >= TELEPORT_COOLDOWN)
-
-        -- If neither teleport nor auto-collect are enabled, stop
         if not allowForwardTeleport and not autoCollectEnabled then
-            itemTasks[item] = nil
-            return
+            itemTasks[item] = nil; return
         end
 
         local prompt = getPrompt(item)
         if not prompt or not prompt.Enabled then
-            itemTasks[item] = nil
-            return
+            itemTasks[item] = nil; return
         end
 
         local promptPart = getPromptPart(prompt) or getPrimaryPart(item)
         if not promptPart then
-            itemTasks[item] = nil
-            return
+            itemTasks[item] = nil; return
         end
 
         local character = player.Character
-        if not character then
-            itemTasks[item] = nil
-            return
-        end
+        if not character then itemTasks[item] = nil; return end
         local rootPart = character:FindFirstChild("HumanoidRootPart")
-        if not rootPart then
-            itemTasks[item] = nil
-            return
-        end
+        if not rootPart then itemTasks[item] = nil; return end
 
         local originalCFrame = rootPart.CFrame
         local didTeleport = false
 
-        -- Forward teleport only if cooldown allows
         if allowForwardTeleport then
-            local targetCFrame = promptPart.CFrame + Vector3.new(0, TELEPORT_HEIGHT, 0)
+            local targetCFrame = promptPart.CFrame * CFrame.new(HORIZONTAL_OFFSET, TELEPORT_HEIGHT, 0)
             pcall(function() character:PivotTo(targetCFrame) end)
             didTeleport = true
             lastTeleportTime = tick()
             task.wait(0.25)
         end
 
-        -- Auto collect
         if autoCollectEnabled and not processedItems[item] then
             local originalLOS = prompt.RequiresLineOfSight
             prompt.RequiresLineOfSight = false
@@ -176,20 +153,10 @@ local function scheduleTeleport(item)
 
             if triggered then
                 processedItems[item] = true
-
-                -- Increment counter
                 local name = item.Name
                 if collectedCounts[name] ~= nil then
                     collectedCounts[name] = collectedCounts[name] + 1
                     updateCounter(name)
-                end
-
-                -- Respawn after collect
-                if respawnAfterCollect then
-                    task.wait(0.2)
-                    if player.Character then
-                        pcall(function() player:LoadCharacter() end)
-                    end
                 end
             end
 
@@ -197,12 +164,10 @@ local function scheduleTeleport(item)
             prompt.RequiresLineOfSight = originalLOS
         end
 
-        -- Return to previous position (only if we teleported forward)
         if didTeleport then
             pcall(function() character:PivotTo(originalCFrame) end)
         end
 
-        -- Release the lock
         itemTasks[item] = nil
     end)
 end
@@ -210,14 +175,12 @@ end
 -- ── Detection ──────────────────────
 local DROPPED_ITEMS_FOLDER = Workspace:WaitForChild("DroppedItems")
 
--- When a child is added, schedule it (only if has prompt)
 DROPPED_ITEMS_FOLDER.ChildAdded:Connect(function(child)
     if getPrompt(child) and not processedItems[child] then
         scheduleTeleport(child)
     end
 end)
 
--- Fallback scanner (still respects the lock)
 task.spawn(function()
     while true do
         task.wait(0.5)
@@ -229,11 +192,9 @@ task.spawn(function()
     end
 end)
 
-player.CharacterAdded:Connect(function()
-    -- keep processedItems memory
-end)
+player.CharacterAdded:Connect(function() end)
 
--- ── ESP (unchanged) ────────────────
+-- ── ESP (with independent name visibility) ──
 local useDrawing = pcall(function() local d = Drawing.new("Line"); d:Remove() end)
 local espObjects = {}
 
@@ -299,10 +260,13 @@ local function removeESP(item)
 end
 
 local function updateESP()
+    -- Clean up removed items
     for item, _ in pairs(espObjects) do
         if not item:IsDescendantOf(DROPPED_ITEMS_FOLDER) then removeESP(item) end
     end
-    if not espEnabled then
+
+    -- If neither ESP nor Show Name is on, hide everything
+    if not espEnabled and not showItemName then
         for _, obj in pairs(espObjects) do
             if useDrawing then
                 for _, l in ipairs(obj.lines) do l.Visible = false end
@@ -313,6 +277,7 @@ local function updateESP()
         end
         return
     end
+
     for _, item in ipairs(DROPPED_ITEMS_FOLDER:GetChildren()) do
         if not espObjects[item] then createESP(item) end
         local obj = espObjects[item]
@@ -343,11 +308,13 @@ local function updateESP()
                 if not onScreen then anyBehind = true end
                 table.insert(screenPoints, Vector2.new(sp.X, sp.Y))
             end
+
             if anyBehind then
                 for _, l in ipairs(obj.lines) do l.Visible = false end
                 obj.text.Visible = false
                 continue
             end
+
             local minX, minY, maxX, maxY = math.huge, math.huge, -math.huge, -math.huge
             for _, sp in ipairs(screenPoints) do
                 if sp.X < minX then minX = sp.X end
@@ -355,20 +322,44 @@ local function updateESP()
                 if sp.X > maxX then maxX = sp.X end
                 if sp.Y > maxY then maxY = sp.Y end
             end
-            obj.lines[1].From, obj.lines[1].To = Vector2.new(minX, minY), Vector2.new(maxX, minY)
-            obj.lines[2].From, obj.lines[2].To = Vector2.new(maxX, minY), Vector2.new(maxX, maxY)
-            obj.lines[3].From, obj.lines[3].To = Vector2.new(maxX, maxY), Vector2.new(minX, maxY)
-            obj.lines[4].From, obj.lines[4].To = Vector2.new(minX, maxY), Vector2.new(minX, minY)
-            for _, l in ipairs(obj.lines) do l.Visible = true end
-            obj.text.Position = Vector2.new((minX+maxX)/2, minY-20)
-            obj.text.Visible = showItemName
-            obj.text.Color = espTextColor
-            obj.text.Text = item.Name
+
+            -- Box outline (only if ESP enabled)
+            if espEnabled then
+                obj.lines[1].From, obj.lines[1].To = Vector2.new(minX, minY), Vector2.new(maxX, minY)
+                obj.lines[2].From, obj.lines[2].To = Vector2.new(maxX, minY), Vector2.new(maxX, maxY)
+                obj.lines[3].From, obj.lines[3].To = Vector2.new(maxX, maxY), Vector2.new(minX, maxY)
+                obj.lines[4].From, obj.lines[4].To = Vector2.new(minX, maxY), Vector2.new(minX, minY)
+                for _, l in ipairs(obj.lines) do
+                    l.Visible = true
+                    l.Color = espOutlineColor
+                end
+            else
+                for _, l in ipairs(obj.lines) do l.Visible = false end
+            end
+
+            -- Name label (independent of ESP)
+            if showItemName then
+                obj.text.Visible = true
+                obj.text.Text = item.Name
+                obj.text.Color = espTextColor
+                obj.text.Position = Vector2.new((minX + maxX) / 2, minY - 20)
+            else
+                obj.text.Visible = false
+            end
         else
-            obj.Enabled = true
+            -- BillboardGui fallback (same logic)
+            if espEnabled or showItemName then
+                obj.Enabled = true
+            else
+                obj.Enabled = false
+            end
             local frame = obj:FindFirstChildOfClass("Frame")
-            if frame and frame:FindFirstChildOfClass("UIStroke") then
-                frame:FindFirstChildOfClass("UIStroke").Color = espOutlineColor
+            if frame then
+                local stroke = frame:FindFirstChildOfClass("UIStroke")
+                if stroke then
+                    stroke.Color = espOutlineColor
+                    frame.Visible = espEnabled   -- hide box frame when ESP off
+                end
             end
             local label = obj:FindFirstChildOfClass("TextLabel")
             if label then
@@ -382,7 +373,7 @@ end
 
 DROPPED_ITEMS_FOLDER.ChildRemoved:Connect(function(child)
     removeESP(child)
-    itemTasks[child] = nil   -- clean up lock
+    itemTasks[child] = nil
 end)
 
 -- ── UI Tabs ────────────────────────
@@ -405,25 +396,13 @@ local ESPTab = Window:MakeTab({
 AutoTab:AddToggle({
     Name = "Auto Collect",
     Default = false,
-    Callback = function(Value)
-        autoCollectEnabled = Value
-    end
+    Callback = function(Value) autoCollectEnabled = Value end
 })
 
 AutoTab:AddToggle({
     Name = "Teleport",
     Default = false,
-    Callback = function(Value)
-        teleportEnabled = Value
-    end
-})
-
-AutoTab:AddToggle({
-    Name = "Respawn After Collect",
-    Default = false,
-    Callback = function(Value)
-        respawnAfterCollect = Value
-    end
+    Callback = function(Value) teleportEnabled = Value end
 })
 
 AutoTab:AddSlider({
@@ -434,9 +413,18 @@ AutoTab:AddSlider({
     Color = Color3.fromRGB(255,255,255),
     Increment = 0.1,
     ValueName = "studs up",
-    Callback = function(Value)
-        TELEPORT_HEIGHT = Value
-    end
+    Callback = function(Value) TELEPORT_HEIGHT = Value end
+})
+
+AutoTab:AddSlider({
+    Name = "Horizontal Offset",
+    Min = -5,
+    Max = 5,
+    Default = 0,
+    Color = Color3.fromRGB(200,200,255),
+    Increment = 0.5,
+    ValueName = "studs (right/left)",
+    Callback = function(Value) HORIZONTAL_OFFSET = Value end
 })
 
 AutoTab:AddSlider({
@@ -447,9 +435,7 @@ AutoTab:AddSlider({
     Color = Color3.fromRGB(255,255,255),
     Increment = 1,
     ValueName = "seconds",
-    Callback = function(Value)
-        SPAWN_DELAY = Value
-    end
+    Callback = function(Value) SPAWN_DELAY = Value end
 })
 
 AutoTab:AddSlider({
@@ -460,9 +446,7 @@ AutoTab:AddSlider({
     Color = Color3.fromRGB(255,255,255),
     Increment = 1,
     ValueName = "seconds",
-    Callback = function(Value)
-        TELEPORT_COOLDOWN = Value
-    end
+    Callback = function(Value) TELEPORT_COOLDOWN = Value end
 })
 
 -- ── Counter Section ────────────────
@@ -475,33 +459,25 @@ end
 ESPTab:AddToggle({
     Name = "Enabled",
     Default = false,
-    Callback = function(Value)
-        espEnabled = Value
-    end
+    Callback = function(Value) espEnabled = Value end
 })
 
 ESPTab:AddColorpicker({
     Name = "Outline Color",
     Default = Color3.fromRGB(255,255,255),
-    Callback = function(Value)
-        espOutlineColor = toColor3(Value)
-    end
+    Callback = function(Value) espOutlineColor = toColor3(Value) end
 })
 
 ESPTab:AddToggle({
     Name = "Show Item Name",
     Default = false,
-    Callback = function(Value)
-        showItemName = Value
-    end
+    Callback = function(Value) showItemName = Value end
 })
 
 ESPTab:AddColorpicker({
     Name = "Name Color",
     Default = Color3.new(1,1,1),
-    Callback = function(Value)
-        espTextColor = toColor3(Value)
-    end
+    Callback = function(Value) espTextColor = toColor3(Value) end
 })
 
 -- ── Finalize ──────────────────────
