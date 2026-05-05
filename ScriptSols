@@ -1,70 +1,127 @@
+-- ╔══════════════════════════════════════════════════════════════════╗
+-- ║           Dropped Items Helper  —  Enhanced Edition              ║
+-- ║  Fixes: UI toggle works, rarity colors match Sol’s RNG          ║
+-- ║  Features: Auto Collect, Teleport, ESP, Filter, Auto Farm,       ║
+-- ║            Stats, Panic, Notifications, Config Save/Load        ║
+-- ╚══════════════════════════════════════════════════════════════════╝
+
 -- Load Orion UI Library
-local OrionLib = loadstring(game:HttpGet("https://raw.githubusercontent.com/Qanuir/orion-ui/refs/heads/main/source.lua"))()
+local OrionLib = loadstring(game:HttpGet(
+    "https://raw.githubusercontent.com/Qanuir/orion-ui/refs/heads/main/source.lua"
+))()
 
 -- Services
-local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
-local Workspace = game:GetService("Workspace")
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local HttpService      = game:GetService("HttpService")
+local TweenService     = game:GetService("TweenService")
+local Workspace        = game:GetService("Workspace")
 
 local player = Players.LocalPlayer
 local camera = Workspace.CurrentCamera
 
--- ── Window ──────────────────────────
+-- ── Window ────────────────────────────────────────────────────────────────────
 local Window = OrionLib:MakeWindow({
-    Name = "Dropped Items Helper",
-    HidePremium = false,
-    SaveConfig = false,
+    Name         = "Dropped Items Helper  ✦  Enhanced",
+    HidePremium  = false,
+    SaveConfig   = false,
     ConfigFolder = "DroppedItemsHelper"
 })
 
--- ── State ──────────────────────────
-local TELEPORT_HEIGHT = 2.5
-local HORIZONTAL_OFFSET = 0
-local SPAWN_DELAY = 1
-local TELEPORT_COOLDOWN = 5
-local lastTeleportTime = 0
+-- ══════════════════════════════════════════════════════════════════════════════
+-- ── State ─────────────────────────────────────────────────────────────────────
+-- ══════════════════════════════════════════════════════════════════════════════
+local TELEPORT_HEIGHT    = 2.5
+local HORIZONTAL_OFFSET  = 0
+local SPAWN_DELAY        = 1
+local TELEPORT_COOLDOWN  = 5
+local AUTO_FARM_INTERVAL = 0.5   -- seconds between farm loop ticks
+local MAX_COLLECT_DIST   = 200   -- studs; 0 = unlimited
+local lastTeleportTime   = 0
 
 local processedItems = {}
-local itemTasks = {}
+local itemTasks      = {}   -- value is true while task is running
 
-local autoCollectEnabled   = false
-local teleportEnabled      = false
-local espEnabled           = false
-local showItemName         = false
-local espOutlineColor      = Color3.fromRGB(255,255,255)
-local espTextColor         = Color3.new(1,1,1)
+-- Feature flags
+local autoCollectEnabled = false
+local teleportEnabled    = false
+local espEnabled         = false
+local showItemName       = false
+local showDistance       = false
+local espOutlineColor    = Color3.fromRGB(255, 255, 255)
+local espTextColor       = Color3.new(1, 1, 1)
+local disable3DRendering = false
+local autoFarmEnabled    = false
+local panicEnabled       = false
+
+-- UI state
+local uiToggleKey   = Enum.KeyCode.Z
+local panicKey      = Enum.KeyCode.P
+local waitingForKey = false
+local waitingForPanicKey = false
 
 -- Tracked items & counters
 local trackedItems = {"Gilded Coin", "Lucky Potion", "Speed Potion", "Coin"}
+
+-- Rarity color map (UPDATED: green, blue, yellow, orange)
+local rarityColors = {
+    ["Gilded Coin"]  = Color3.fromRGB(255, 165,   0),   -- orange
+    ["Lucky Potion"] = Color3.fromRGB(  0, 255,   0),   -- green
+    ["Speed Potion"] = Color3.fromRGB(  0,   0, 255),   -- blue
+    ["Coin"]         = Color3.fromRGB(255, 255,   0),   -- yellow
+}
+local DEFAULT_RARITY_COLOR = Color3.fromRGB(255, 255, 255)
+
+-- Whitelist/Blacklist
+local itemWhitelist = {}
+for _, name in ipairs(trackedItems) do
+    itemWhitelist[name] = true
+end
+local itemBlacklist = {}
+
+-- Collected counters
 local collectedCounts = {}
 for _, name in ipairs(trackedItems) do
     collectedCounts[name] = 0
 end
+local totalCollected = 0
 
+-- Session stats
+local sessionStart  = tick()
 local counterLabels = {}
 
--- ── Utilities ──────────────────────
+-- Forward Declarations
+local configDropdown, uiKeyLabel, panicKeyLabel
+local statsRateLabel, statsTotalLabel, statsTimeLabel
+local updateConfigList
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- ── Utilities ─────────────────────────────────────────────────────────────────
+-- ══════════════════════════════════════════════════════════════════════════════
 local function getPrompt(object)
     local prompt = object:FindFirstChildOfClass("ProximityPrompt")
     if prompt then return prompt end
     local casing = object:FindFirstChild("Casing")
     if casing then
-        prompt = casing:FindFirstChildOfClass("ProximityPrompt")
+        return casing:FindFirstChildOfClass("ProximityPrompt")
     end
-    return prompt
+    return nil
 end
 
 local function getPromptPart(prompt)
     local parent = prompt.Parent
-    while parent do
+    local depth  = 0
+    while parent and depth < 5 do
         if parent:IsA("BasePart") then return parent end
         parent = parent.Parent
+        depth  = depth + 1
     end
     return nil
 end
 
 local function getPrimaryPart(item)
-    if item:IsA("BasePart") then return item end
+    if item:IsA("BasePart")  then return item end
     if item:IsA("Model") then
         return item.PrimaryPart or item:FindFirstChildWhichIsA("BasePart")
     end
@@ -73,107 +130,288 @@ end
 
 local function toColor3(val)
     if typeof(val) == "Color3" then return val end
-    if type(val) == "table" then
-        return val.Color or Color3.new(1,1,1)
-    end
-    return Color3.new(1,1,1)
+    if type(val) == "table" and val.Color then return val.Color end
+    return Color3.new(1, 1, 1)
 end
 
 local function updateCounter(name)
     local lbl = counterLabels[name]
     if lbl then
-        lbl:Set(name .. ": " .. collectedCounts[name])
+        lbl:Set(name .. ": " .. tostring(collectedCounts[name]))
     end
 end
 
--- ── Scheduler ──────────────────────
+local function updateStats()
+    local elapsed = tick() - sessionStart
+    local rate    = elapsed > 0 and (totalCollected / (elapsed / 60)) or 0
+    local mins    = math.floor(elapsed / 60)
+    local secs    = math.floor(elapsed % 60)
+    if statsRateLabel  then statsRateLabel:Set(string.format("Items/min: %.1f", rate))                  end
+    if statsTotalLabel then statsTotalLabel:Set("Total Collected: " .. tostring(totalCollected))         end
+    if statsTimeLabel  then statsTimeLabel:Set(string.format("Session Time: %02d:%02d", mins, secs))    end
+end
+
+-- check if an item is allowed by whitelist/blacklist
+local function isItemAllowed(item)
+    local name = item.Name
+    if itemBlacklist[name] then return false end
+    if next(itemWhitelist) ~= nil then
+        return itemWhitelist[name] == true
+    end
+    return true
+end
+
+local function getDistanceTo(item)
+    local character = player.Character
+    if not character then return math.huge end
+    local root = character:FindFirstChild("HumanoidRootPart")
+    if not root then return math.huge end
+    local part = getPrimaryPart(item)
+    if not part then return math.huge end
+    return (root.Position - part.Position).Magnitude
+end
+
+-- ── 3D Rendering ─────────────────────────────────────────────────────────────
+local function set3DRendering(enabled)
+    pcall(function() RunService:Set3dRenderingEnabled(enabled) end)
+end
+
+-- ── Notification System ───────────────────────────────────────────────────────
+local notifGui, notifFrame, notifCount = nil, nil, 0
+
+local function ensureNotifGui()
+    if notifGui and notifGui.Parent then return end
+    notifGui = Instance.new("ScreenGui")
+    notifGui.Name            = "DIH_Notifications"
+    notifGui.ResetOnSpawn    = false
+    notifGui.DisplayOrder    = 999
+    notifGui.IgnoreGuiInset  = true
+    notifGui.Parent          = player.PlayerGui
+
+    notifFrame = Instance.new("Frame")
+    notifFrame.Name                   = "Stack"
+    notifFrame.AnchorPoint            = Vector2.new(1, 1)
+    notifFrame.Position               = UDim2.new(1, -12, 1, -60)
+    notifFrame.Size                   = UDim2.new(0, 280, 1, -70)
+    notifFrame.BackgroundTransparency = 1
+    notifFrame.Parent                 = notifGui
+
+    local layout = Instance.new("UIListLayout")
+    layout.FillDirection      = Enum.FillDirection.Vertical
+    layout.VerticalAlignment  = Enum.VerticalAlignment.Bottom
+    layout.Padding            = UDim.new(0, 6)
+    layout.SortOrder          = Enum.SortOrder.LayoutOrder
+    layout.Parent             = notifFrame
+end
+
+local function notify(title, body, color)
+    pcall(function()
+        ensureNotifGui()
+        color = color or Color3.fromRGB(60, 180, 100)
+
+        notifCount      = notifCount + 1
+        local card      = Instance.new("Frame")
+        card.Name       = "notif_" .. notifCount
+        card.Size       = UDim2.new(1, 0, 0, 54)
+        card.BackgroundColor3 = Color3.fromRGB(20, 20, 28)
+        card.BackgroundTransparency = 0.1
+        card.BorderSizePixel = 0
+        card.LayoutOrder = notifCount
+        card.Parent     = notifFrame
+
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 8)
+        corner.Parent = card
+
+        local accent = Instance.new("Frame")
+        accent.Size             = UDim2.new(0, 4, 1, 0)
+        accent.BackgroundColor3 = color
+        accent.BorderSizePixel  = 0
+        accent.Parent           = card
+        local acorner = Instance.new("UICorner")
+        acorner.CornerRadius = UDim.new(0, 4)
+        acorner.Parent = accent
+
+        local ttl = Instance.new("TextLabel")
+        ttl.Position              = UDim2.new(0, 14, 0, 4)
+        ttl.Size                  = UDim2.new(1, -18, 0, 22)
+        ttl.BackgroundTransparency = 1
+        ttl.TextColor3            = Color3.new(1, 1, 1)
+        ttl.TextSize              = 13
+        ttl.Font                  = Enum.Font.GothamBold
+        ttl.Text                  = title
+        ttl.TextXAlignment        = Enum.TextXAlignment.Left
+        ttl.Parent                = card
+
+        local bod = Instance.new("TextLabel")
+        bod.Position              = UDim2.new(0, 14, 0, 26)
+        bod.Size                  = UDim2.new(1, -18, 0, 20)
+        bod.BackgroundTransparency = 1
+        bod.TextColor3            = Color3.fromRGB(180, 180, 190)
+        bod.TextSize              = 11
+        bod.Font                  = Enum.Font.Gotham
+        bod.Text                  = body or ""
+        bod.TextXAlignment        = Enum.TextXAlignment.Left
+        bod.Parent                = card
+
+        -- Animate in
+        card.Position = UDim2.new(1.1, 0, card.Position.Y.Scale, card.Position.Y.Offset)
+        TweenService:Create(card, TweenInfo.new(0.3, Enum.EasingStyle.Quint), {
+            Position = UDim2.new(0, 0, card.Position.Y.Scale, card.Position.Y.Offset)
+        }):Play()
+
+        -- Auto-dismiss after 3s
+        task.delay(3, function()
+            local tw = TweenService:Create(card, TweenInfo.new(0.25, Enum.EasingStyle.Quint), {
+                Position = UDim2.new(1.1, 0, card.Position.Y.Scale, card.Position.Y.Offset),
+                BackgroundTransparency = 1,
+            })
+            tw:Play()
+            tw.Completed:Wait()
+            pcall(function() card:Destroy() end)
+        end)
+    end)
+end
+
+-- ── JSON Helpers ──────────────────────────────────────────────────────────────
+local function color3ToTable(c) return {r = c.R, g = c.G, b = c.B} end
+local function tableToColor3(t)
+    if type(t) == "table" and t.r ~= nil then
+        return Color3.new(t.r, t.g, t.b)
+    end
+    return Color3.new(1, 1, 1)
+end
+local function keyCodeToString(kc) return kc.Name end
+local function stringToKeyCode(s)
+    local ok, kc = pcall(function() return Enum.KeyCode[s] end)
+    return (ok and kc) and kc or Enum.KeyCode.Z
+end
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- ── Core Scheduler ───────────────────────────────────────────────────────────
+-- ══════════════════════════════════════════════════════════════════════════════
+
+-- sort candidate items by distance (nearest first)
+local function getSortedItems()
+    local items = {}
+    for _, child in ipairs(DROPPED_ITEMS_FOLDER and DROPPED_ITEMS_FOLDER:GetChildren() or {}) do
+        if getPrompt(child) and not processedItems[child] and isItemAllowed(child) then
+            local dist = getDistanceTo(child)
+            if MAX_COLLECT_DIST <= 0 or dist <= MAX_COLLECT_DIST then
+                table.insert(items, {item = child, dist = dist})
+            end
+        end
+    end
+    table.sort(items, function(a, b) return a.dist < b.dist end)
+    local result = {}
+    for _, entry in ipairs(items) do table.insert(result, entry.item) end
+    return result
+end
+
+local DROPPED_ITEMS_FOLDER
+
 local function scheduleTeleport(item)
     if itemTasks[item] then return end
+    if panicEnabled      then return end
+    if not isItemAllowed(item) then return end
+
+    -- Distance check
+    if MAX_COLLECT_DIST > 0 and getDistanceTo(item) > MAX_COLLECT_DIST then return end
+
     itemTasks[item] = true
 
     task.spawn(function()
-        if SPAWN_DELAY > 0 then task.wait(SPAWN_DELAY) end
+        local ok, err = pcall(function()
 
-        if not item:IsDescendantOf(Workspace) then
-            itemTasks[item] = nil; return
-        end
-        if processedItems[item] then
-            itemTasks[item] = nil; return
-        end
+            if SPAWN_DELAY > 0 then task.wait(SPAWN_DELAY) end
+            if panicEnabled then return end
+            if not item:IsDescendantOf(Workspace) then return end
+            if processedItems[item] then return end
 
-        local allowForwardTeleport = teleportEnabled and (tick() - lastTeleportTime >= TELEPORT_COOLDOWN)
-        if not allowForwardTeleport and not autoCollectEnabled then
-            itemTasks[item] = nil; return
-        end
+            local allowTeleport = teleportEnabled and (tick() - lastTeleportTime >= TELEPORT_COOLDOWN)
+            if not allowTeleport and not autoCollectEnabled then return end
 
-        local prompt = getPrompt(item)
-        if not prompt or not prompt.Enabled then
-            itemTasks[item] = nil; return
-        end
+            local prompt = getPrompt(item)
+            if not prompt or not prompt.Enabled then return end
 
-        local promptPart = getPromptPart(prompt) or getPrimaryPart(item)
-        if not promptPart then
-            itemTasks[item] = nil; return
-        end
+            local promptPart = getPromptPart(prompt) or getPrimaryPart(item)
+            if not promptPart then return end
 
-        local character = player.Character
-        if not character then itemTasks[item] = nil; return end
-        local rootPart = character:FindFirstChild("HumanoidRootPart")
-        if not rootPart then itemTasks[item] = nil; return end
+            local character = player.Character
+            if not character then return end
+            local rootPart  = character:FindFirstChild("HumanoidRootPart")
+            if not rootPart then return end
 
-        local originalCFrame = rootPart.CFrame
-        local didTeleport = false
+            local originalCFrame = rootPart.CFrame
+            local didTeleport    = false
 
-        if allowForwardTeleport then
-            local targetCFrame = promptPart.CFrame * CFrame.new(HORIZONTAL_OFFSET, TELEPORT_HEIGHT, 0)
-            pcall(function() character:PivotTo(targetCFrame) end)
-            didTeleport = true
-            lastTeleportTime = tick()
-            task.wait(0.25)
-        end
+            if allowTeleport then
+                local target = promptPart.CFrame * CFrame.new(HORIZONTAL_OFFSET, TELEPORT_HEIGHT, 0)
+                pcall(function() character:PivotTo(target) end)
+                didTeleport      = true
+                lastTeleportTime = tick()
+                task.wait(0.25)
+            end
 
-        if autoCollectEnabled and not processedItems[item] then
-            local originalLOS = prompt.RequiresLineOfSight
-            prompt.RequiresLineOfSight = false
+            if autoCollectEnabled and not processedItems[item] then
+                local originalLOS = prompt.RequiresLineOfSight
+                prompt.RequiresLineOfSight = false
 
-            local triggered = false
-            local conn
-            pcall(function()
-                conn = prompt.Triggered:Connect(function()
-                    triggered = true
-                    if conn then conn:Disconnect() end
+                local triggered = false
+                local conn
+                pcall(function()
+                    conn = prompt.Triggered:Connect(function()
+                        triggered = true
+                        pcall(function() conn:Disconnect() end)
+                    end)
                 end)
-            end)
-            pcall(function() prompt:InputHoldBegin() end)
+                pcall(function() prompt:InputHoldBegin() end)
 
-            local start = tick()
-            while not triggered and tick() - start < 3 do
-                RunService.Heartbeat:Wait()
-            end
-
-            if triggered then
-                processedItems[item] = true
-                local name = item.Name
-                if collectedCounts[name] ~= nil then
-                    collectedCounts[name] = collectedCounts[name] + 1
-                    updateCounter(name)
+                local start = tick()
+                while not triggered and tick() - start < 3 do
+                    RunService.Heartbeat:Wait()
                 end
+
+                if triggered then
+                    processedItems[item] = true
+                    local iname = item.Name
+                    totalCollected = totalCollected + 1
+
+                    if collectedCounts[iname] ~= nil then
+                        collectedCounts[iname] = collectedCounts[iname] + 1
+                        updateCounter(iname)
+                    end
+
+                    -- Notification on collect
+                    notify(
+                        "✦ Collected",
+                        iname .. " (" .. (collectedCounts[iname] or "?") .. "x)",
+                        rarityColors[iname] or DEFAULT_RARITY_COLOR
+                    )
+                end
+
+                pcall(function() conn:Disconnect() end)
+                pcall(function() prompt.RequiresLineOfSight = originalLOS end)
             end
 
-            if conn then pcall(function() conn:Disconnect() end) end
-            prompt.RequiresLineOfSight = originalLOS
-        end
+            if didTeleport then
+                pcall(function() character:PivotTo(originalCFrame) end)
+            end
 
-        if didTeleport then
-            pcall(function() character:PivotTo(originalCFrame) end)
-        end
+        end)
 
+        if not ok then
+            warn("[DIH] scheduleTeleport error:", err)
+        end
+        -- Always release the lock
         itemTasks[item] = nil
     end)
 end
 
--- ── Detection ──────────────────────
-local DROPPED_ITEMS_FOLDER = Workspace:WaitForChild("DroppedItems")
+-- ══════════════════════════════════════════════════════════════════════════════
+-- ── Detection ─────────────────────────────────────────────────────────────────
+-- ══════════════════════════════════════════════════════════════════════════════
+DROPPED_ITEMS_FOLDER = Workspace:WaitForChild("DroppedItems")
 
 DROPPED_ITEMS_FOLDER.ChildAdded:Connect(function(child)
     if getPrompt(child) and not processedItems[child] then
@@ -181,9 +419,11 @@ DROPPED_ITEMS_FOLDER.ChildAdded:Connect(function(child)
     end
 end)
 
+-- Regular scan (items that were present before script start)
 task.spawn(function()
     while true do
         task.wait(0.5)
+        if panicEnabled then continue end
         for _, child in ipairs(DROPPED_ITEMS_FOLDER:GetChildren()) do
             if getPrompt(child) and not processedItems[child] then
                 scheduleTeleport(child)
@@ -192,85 +432,144 @@ task.spawn(function()
     end
 end)
 
-player.CharacterAdded:Connect(function() end)
+-- Auto-Farm Loop
+task.spawn(function()
+    while true do
+        task.wait(AUTO_FARM_INTERVAL)
+        if not autoFarmEnabled or panicEnabled then continue end
 
--- ── ESP (with independent name visibility) ──
+        local sorted = getSortedItems()
+        for _, item in ipairs(sorted) do
+            if panicEnabled then break end
+            scheduleTeleport(item)
+            task.wait(0.05)
+        end
+    end
+end)
+
+-- Stats update loop
+task.spawn(function()
+    while true do
+        task.wait(1)
+        updateStats()
+    end
+end)
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- ── ESP ──────────────────────────────────────────────────────────────────────
+-- ══════════════════════════════════════════════════════════════════════════════
 local useDrawing = pcall(function() local d = Drawing.new("Line"); d:Remove() end)
 local espObjects = {}
 
+local function getRarityColor(item)
+    return rarityColors[item.Name] or espOutlineColor
+end
+
 local function createESP(item)
+    if espObjects[item] then return end
+
     if useDrawing then
         local lines = {}
-        for i = 1, 4 do
-            local line = Drawing.new("Line")
-            line.Visible = false
-            line.Color = espOutlineColor
-            line.Thickness = 2
+        for _ = 1, 4 do
+            local line      = Drawing.new("Line")
+            line.Visible    = false
+            line.Color      = getRarityColor(item)
+            line.Thickness  = 2
             table.insert(lines, line)
         end
-        local text = Drawing.new("Text")
+        local text   = Drawing.new("Text")
         text.Visible = false
-        text.Color = espTextColor
-        text.Size = 18
-        text.Font = 2
-        text.Center = true
-        espObjects[item] = { lines = lines, text = text }
+        text.Color   = espTextColor
+        text.Size    = 18
+        text.Font    = 2
+        text.Center  = true
+
+        local distText   = Drawing.new("Text")
+        distText.Visible = false
+        distText.Color   = Color3.fromRGB(200, 200, 200)
+        distText.Size    = 14
+        distText.Font    = 2
+        distText.Center  = true
+
+        espObjects[item] = {lines = lines, text = text, distText = distText}
     else
         local adornee = getPrimaryPart(item) or item
         if not adornee then return end
-        local gui = Instance.new("BillboardGui")
-        gui.Size = UDim2.new(4,0,4,0)
-        gui.AlwaysOnTop = true
-        gui.Adornee = adornee
-        gui.Parent = item
-        local frame = Instance.new("Frame")
-        frame.Size = UDim2.new(1,0,1,0)
-        frame.BackgroundTransparency = 1
-        frame.BorderSizePixel = 0
-        local stroke = Instance.new("UIStroke")
-        stroke.Color = espOutlineColor
-        stroke.Thickness = 2
-        stroke.Parent = frame
-        frame.Parent = gui
-        local label = Instance.new("TextLabel")
-        label.Size = UDim2.new(1,0,0,30)
-        label.Position = UDim2.new(0,0,-0.2,0)
-        label.AnchorPoint = Vector2.new(0.5,1)
-        label.BackgroundTransparency = 1
-        label.TextColor3 = espTextColor
-        label.TextSize = 18
-        label.Text = item.Name
-        label.Visible = showItemName
-        label.Parent = gui
+
+        local gui              = Instance.new("BillboardGui")
+        gui.Size               = UDim2.new(4, 0, 4, 0)
+        gui.AlwaysOnTop        = true
+        gui.Adornee            = adornee
+        gui.Parent             = item
+
+        local frame                   = Instance.new("Frame")
+        frame.Size                    = UDim2.new(1, 0, 1, 0)
+        frame.BackgroundTransparency  = 1
+        frame.BorderSizePixel         = 0
+
+        local stroke          = Instance.new("UIStroke")
+        stroke.Color          = getRarityColor(item)
+        stroke.Thickness      = 2
+        stroke.Parent         = frame
+        frame.Parent          = gui
+
+        local label                   = Instance.new("TextLabel")
+        label.Size                    = UDim2.new(1, 0, 0, 28)
+        label.Position                = UDim2.new(0, 0, -0.22, 0)
+        label.AnchorPoint             = Vector2.new(0.5, 1)
+        label.BackgroundTransparency  = 1
+        label.TextColor3              = espTextColor
+        label.TextSize                = 18
+        label.Font                    = Enum.Font.GothamBold
+        label.Text                    = item.Name
+        label.Visible                 = showItemName
+        label.Parent                  = gui
+
+        local distLabel               = Instance.new("TextLabel")
+        distLabel.Name                = "DistLabel"
+        distLabel.Size                = UDim2.new(1, 0, 0, 20)
+        distLabel.Position            = UDim2.new(0, 0, 1.05, 0)
+        distLabel.BackgroundTransparency = 1
+        distLabel.TextColor3          = Color3.fromRGB(180, 180, 180)
+        distLabel.TextSize            = 13
+        distLabel.Font                = Enum.Font.Gotham
+        distLabel.Text                = ""
+        distLabel.Visible             = showDistance
+        distLabel.Parent              = gui
+
         espObjects[item] = gui
     end
 end
 
 local function removeESP(item)
     local obj = espObjects[item]
-    if obj then
-        if useDrawing then
-            for _, l in ipairs(obj.lines) do l:Remove() end
-            obj.text:Remove()
-        else
-            obj:Destroy()
-        end
-        espObjects[item] = nil
+    if not obj then return end
+    espObjects[item] = nil
+    if useDrawing then
+        pcall(function() for _, l in ipairs(obj.lines) do l:Remove() end end)
+        pcall(function() obj.text:Remove()     end)
+        pcall(function() obj.distText:Remove() end)
+    else
+        pcall(function() obj:Destroy() end)
     end
 end
 
 local function updateESP()
-    -- Clean up removed items
-    for item, _ in pairs(espObjects) do
-        if not item:IsDescendantOf(DROPPED_ITEMS_FOLDER) then removeESP(item) end
+    -- Remove stale entries
+    for item in pairs(espObjects) do
+        if not item:IsDescendantOf(DROPPED_ITEMS_FOLDER) then
+            removeESP(item)
+        end
     end
 
-    -- If neither ESP nor Show Name is on, hide everything
-    if not espEnabled and not showItemName then
+    local needESP = espEnabled or showItemName or showDistance
+
+    if not needESP then
         for _, obj in pairs(espObjects) do
             if useDrawing then
                 for _, l in ipairs(obj.lines) do l.Visible = false end
-                obj.text.Visible = false
+                obj.text.Visible     = false
+                obj.distText.Visible = false
             else
                 obj.Enabled = false
             end
@@ -283,13 +582,18 @@ local function updateESP()
         local obj = espObjects[item]
         if not obj then continue end
 
+        local dist = getDistanceTo(item)
+        local distStr = string.format("%.0f studs", dist)
+
         if useDrawing then
             local prim = getPrimaryPart(item)
             if not prim then
                 for _, l in ipairs(obj.lines) do l.Visible = false end
-                obj.text.Visible = false
+                obj.text.Visible     = false
+                obj.distText.Visible = false
                 continue
             end
+
             local cf, size = prim.CFrame, prim.Size
             local corners = {
                 (cf * CFrame.new(-size.X/2, -size.Y/2, -size.Z/2)).Position,
@@ -301,8 +605,9 @@ local function updateESP()
                 (cf * CFrame.new( size.X/2,  size.Y/2,  size.Z/2)).Position,
                 (cf * CFrame.new(-size.X/2,  size.Y/2,  size.Z/2)).Position,
             }
+
             local screenPoints = {}
-            local anyBehind = false
+            local anyBehind    = false
             for _, wp in ipairs(corners) do
                 local sp, onScreen = camera:WorldToViewportPoint(wp)
                 if not onScreen then anyBehind = true end
@@ -311,11 +616,13 @@ local function updateESP()
 
             if anyBehind then
                 for _, l in ipairs(obj.lines) do l.Visible = false end
-                obj.text.Visible = false
+                obj.text.Visible     = false
+                obj.distText.Visible = false
                 continue
             end
 
-            local minX, minY, maxX, maxY = math.huge, math.huge, -math.huge, -math.huge
+            local minX, minY =  math.huge,  math.huge
+            local maxX, maxY = -math.huge, -math.huge
             for _, sp in ipairs(screenPoints) do
                 if sp.X < minX then minX = sp.X end
                 if sp.Y < minY then minY = sp.Y end
@@ -323,7 +630,8 @@ local function updateESP()
                 if sp.Y > maxY then maxY = sp.Y end
             end
 
-            -- Box outline (only if ESP enabled)
+            local rcol = getRarityColor(item)
+
             if espEnabled then
                 obj.lines[1].From, obj.lines[1].To = Vector2.new(minX, minY), Vector2.new(maxX, minY)
                 obj.lines[2].From, obj.lines[2].To = Vector2.new(maxX, minY), Vector2.new(maxX, maxY)
@@ -331,41 +639,55 @@ local function updateESP()
                 obj.lines[4].From, obj.lines[4].To = Vector2.new(minX, maxY), Vector2.new(minX, minY)
                 for _, l in ipairs(obj.lines) do
                     l.Visible = true
-                    l.Color = espOutlineColor
+                    l.Color   = rcol
                 end
             else
                 for _, l in ipairs(obj.lines) do l.Visible = false end
             end
 
-            -- Name label (independent of ESP)
+            local midX = (minX + maxX) / 2
+
             if showItemName then
-                obj.text.Visible = true
-                obj.text.Text = item.Name
-                obj.text.Color = espTextColor
-                obj.text.Position = Vector2.new((minX + maxX) / 2, minY - 20)
+                obj.text.Visible  = true
+                obj.text.Text     = item.Name
+                obj.text.Color    = rcol
+                obj.text.Position = Vector2.new(midX, minY - 20)
             else
                 obj.text.Visible = false
             end
-        else
-            -- BillboardGui fallback (same logic)
-            if espEnabled or showItemName then
-                obj.Enabled = true
+
+            if showDistance then
+                obj.distText.Visible  = true
+                obj.distText.Text     = distStr
+                obj.distText.Position = Vector2.new(midX, maxY + 4)
             else
-                obj.Enabled = false
+                obj.distText.Visible = false
             end
+
+        else
+            -- BillboardGui path
+            obj.Enabled = needESP
+
             local frame = obj:FindFirstChildOfClass("Frame")
             if frame then
                 local stroke = frame:FindFirstChildOfClass("UIStroke")
                 if stroke then
-                    stroke.Color = espOutlineColor
-                    frame.Visible = espEnabled   -- hide box frame when ESP off
+                    stroke.Color  = getRarityColor(item)
+                    frame.Visible = espEnabled
                 end
             end
-            local label = obj:FindFirstChildOfClass("TextLabel")
+
+            local label = obj:FindFirstChildWhichIsA("TextLabel")
             if label then
-                label.Visible = showItemName
+                label.Visible    = showItemName
                 label.TextColor3 = espTextColor
-                label.Text = item.Name
+                label.Text       = item.Name
+            end
+
+            local distLabel = obj:FindFirstChild("DistLabel")
+            if distLabel then
+                distLabel.Visible = showDistance
+                distLabel.Text    = distStr
             end
         end
     end
@@ -374,114 +696,483 @@ end
 DROPPED_ITEMS_FOLDER.ChildRemoved:Connect(function(child)
     removeESP(child)
     itemTasks[child] = nil
+    processedItems[child] = nil
 end)
 
--- ── UI Tabs ────────────────────────
-local AutoTab = Window:MakeTab({
-    Name = "Auto Collect",
-    Icon = "rbxassetid://7733967807"
-})
+RunService.RenderStepped:Connect(updateESP)
 
-local CounterTab = Window:MakeTab({
-    Name = "Counter",
-    Icon = "rbxassetid://7733967807"
-})
-
-local ESPTab = Window:MakeTab({
-    Name = "ESP",
-    Icon = "rbxassetid://7733967807"
-})
-
--- ── Auto Collect Section ───────────
-AutoTab:AddToggle({
-    Name = "Auto Collect",
-    Default = false,
-    Callback = function(Value) autoCollectEnabled = Value end
-})
-
-AutoTab:AddToggle({
-    Name = "Teleport",
-    Default = false,
-    Callback = function(Value) teleportEnabled = Value end
-})
-
-AutoTab:AddSlider({
-    Name = "Teleport Height",
-    Min = 1,
-    Max = 5,
-    Default = 2.5,
-    Color = Color3.fromRGB(255,255,255),
-    Increment = 0.1,
-    ValueName = "studs up",
-    Callback = function(Value) TELEPORT_HEIGHT = Value end
-})
-
-AutoTab:AddSlider({
-    Name = "Horizontal Offset",
-    Min = -5,
-    Max = 5,
-    Default = 0,
-    Color = Color3.fromRGB(200,200,255),
-    Increment = 0.5,
-    ValueName = "studs (right/left)",
-    Callback = function(Value) HORIZONTAL_OFFSET = Value end
-})
-
-AutoTab:AddSlider({
-    Name = "Spawn Delay",
-    Min = 0,
-    Max = 10,
-    Default = 1,
-    Color = Color3.fromRGB(255,255,255),
-    Increment = 1,
-    ValueName = "seconds",
-    Callback = function(Value) SPAWN_DELAY = Value end
-})
-
-AutoTab:AddSlider({
-    Name = "Teleport Cooldown",
-    Min = 0,
-    Max = 10,
-    Default = 5,
-    Color = Color3.fromRGB(255,255,255),
-    Increment = 1,
-    ValueName = "seconds",
-    Callback = function(Value) TELEPORT_COOLDOWN = Value end
-})
-
--- ── Counter Section ────────────────
-for _, name in ipairs(trackedItems) do
-    local lbl = CounterTab:AddLabel(name .. ": 0")
-    counterLabels[name] = lbl
+-- ══════════════════════════════════════════════════════════════════════════════
+-- ── UI Toggle + Key Rebinding (FIXED) ────────────────────────────────────────
+-- ══════════════════════════════════════════════════════════════════════════════
+local function setUiToggleKey(newKey)
+    uiToggleKey = newKey
+    if uiKeyLabel then
+        uiKeyLabel:Set("UI Toggle Key: " .. newKey.Name)
+    end
+    notify("Keybind Set", "UI Toggle → " .. newKey.Name, Color3.fromRGB(100, 160, 255))
 end
 
--- ── ESP Section ────────────────────
-ESPTab:AddToggle({
-    Name = "Enabled",
-    Default = false,
-    Callback = function(Value) espEnabled = Value end
+local function setPanicKey(newKey)
+    panicKey = newKey
+    if panicKeyLabel then
+        panicKeyLabel:Set("Panic Key: " .. newKey.Name)
+    end
+    notify("Keybind Set", "Panic → " .. newKey.Name, Color3.fromRGB(255, 80, 80))
+end
+
+local function triggerPanic()
+    panicEnabled       = true
+    autoCollectEnabled = false
+    teleportEnabled    = false
+    autoFarmEnabled    = false
+    espEnabled         = false
+    showItemName       = false
+    showDistance       = false
+
+    for item in pairs(itemTasks) do
+        itemTasks[item] = nil
+    end
+
+    notify("⚠ PANIC", "All features disabled", Color3.fromRGB(255, 60, 60))
+
+    task.delay(0.5, function()
+        panicEnabled = false
+    end)
+end
+
+local mainGui   -- cache for the Orion ScreenGui
+
+local function findMainGui()
+    for _, gui in ipairs(player.PlayerGui:GetChildren()) do
+        if gui:IsA("ScreenGui") and (gui.Name == "Orion" or gui.Name == "OrionLib") then
+            mainGui = gui
+            return
+        end
+    end
+end
+
+local function toggleUI()
+    if mainGui then
+        mainGui.Enabled = not mainGui.Enabled
+    else
+        findMainGui()
+        if mainGui then
+            mainGui.Enabled = not mainGui.Enabled
+        end
+    end
+end
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+    if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+
+    if waitingForKey then
+        waitingForKey = false
+        setUiToggleKey(input.KeyCode)
+        return
+    end
+
+    if waitingForPanicKey then
+        waitingForPanicKey = false
+        setPanicKey(input.KeyCode)
+        return
+    end
+
+    if input.KeyCode == panicKey then
+        triggerPanic()
+        return
+    end
+
+    if input.KeyCode == uiToggleKey then
+        toggleUI()
+    end
+end)
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- ── Config System ─────────────────────────────────────────────────────────────
+-- ══════════════════════════════════════════════════════════════════════════════
+local CONFIG_DIR    = "DroppedItemsHelper/Configs/"
+local AUTOLOAD_FILE = CONFIG_DIR .. "autoload.json"
+
+local function ensureDirs()
+    pcall(function() makefolder("DroppedItemsHelper") end)
+    pcall(function() makefolder("DroppedItemsHelper/Configs") end)
+end
+
+local function getSettingsTable()
+    return {
+        TELEPORT_HEIGHT    = TELEPORT_HEIGHT,
+        HORIZONTAL_OFFSET  = HORIZONTAL_OFFSET,
+        SPAWN_DELAY        = SPAWN_DELAY,
+        TELEPORT_COOLDOWN  = TELEPORT_COOLDOWN,
+        AUTO_FARM_INTERVAL = AUTO_FARM_INTERVAL,
+        MAX_COLLECT_DIST   = MAX_COLLECT_DIST,
+        autoCollectEnabled = autoCollectEnabled,
+        teleportEnabled    = teleportEnabled,
+        autoFarmEnabled    = autoFarmEnabled,
+        espEnabled         = espEnabled,
+        showItemName       = showItemName,
+        showDistance       = showDistance,
+        espOutlineColor    = color3ToTable(espOutlineColor),
+        espTextColor       = color3ToTable(espTextColor),
+        disable3DRendering = disable3DRendering,
+        uiToggleKey        = keyCodeToString(uiToggleKey),
+        panicKey           = keyCodeToString(panicKey),
+        collectedCounts    = collectedCounts,
+        itemWhitelist      = itemWhitelist,
+        itemBlacklist      = itemBlacklist,
+        totalCollected     = totalCollected,
+    }
+end
+
+local function applySettings(tbl)
+    if tbl.TELEPORT_HEIGHT    ~= nil then TELEPORT_HEIGHT    = tbl.TELEPORT_HEIGHT    end
+    if tbl.HORIZONTAL_OFFSET  ~= nil then HORIZONTAL_OFFSET  = tbl.HORIZONTAL_OFFSET  end
+    if tbl.SPAWN_DELAY        ~= nil then SPAWN_DELAY        = tbl.SPAWN_DELAY        end
+    if tbl.TELEPORT_COOLDOWN  ~= nil then TELEPORT_COOLDOWN  = tbl.TELEPORT_COOLDOWN  end
+    if tbl.AUTO_FARM_INTERVAL ~= nil then AUTO_FARM_INTERVAL = tbl.AUTO_FARM_INTERVAL end
+    if tbl.MAX_COLLECT_DIST   ~= nil then MAX_COLLECT_DIST   = tbl.MAX_COLLECT_DIST   end
+    if tbl.autoCollectEnabled ~= nil then autoCollectEnabled = tbl.autoCollectEnabled end
+    if tbl.teleportEnabled    ~= nil then teleportEnabled    = tbl.teleportEnabled    end
+    if tbl.autoFarmEnabled    ~= nil then autoFarmEnabled    = tbl.autoFarmEnabled    end
+    if tbl.espEnabled         ~= nil then espEnabled         = tbl.espEnabled         end
+    if tbl.showItemName       ~= nil then showItemName       = tbl.showItemName       end
+    if tbl.showDistance       ~= nil then showDistance       = tbl.showDistance       end
+    if tbl.espOutlineColor    ~= nil then espOutlineColor    = tableToColor3(tbl.espOutlineColor) end
+    if tbl.espTextColor       ~= nil then espTextColor       = tableToColor3(tbl.espTextColor)    end
+    if tbl.totalCollected     ~= nil then totalCollected     = tbl.totalCollected     end
+
+    if tbl.disable3DRendering ~= nil then
+        disable3DRendering = tbl.disable3DRendering
+        set3DRendering(not disable3DRendering)
+    end
+
+    if tbl.uiToggleKey ~= nil then
+        uiToggleKey = stringToKeyCode(tbl.uiToggleKey)
+        if uiKeyLabel then uiKeyLabel:Set("UI Toggle Key: " .. uiToggleKey.Name) end
+    end
+
+    if tbl.panicKey ~= nil then
+        panicKey = stringToKeyCode(tbl.panicKey)
+        if panicKeyLabel then panicKeyLabel:Set("Panic Key: " .. panicKey.Name) end
+    end
+
+    if tbl.collectedCounts then
+        for k, v in pairs(tbl.collectedCounts) do
+            if collectedCounts[k] ~= nil then
+                collectedCounts[k] = v
+                updateCounter(k)
+            end
+        end
+    end
+
+    if tbl.itemWhitelist then
+        for k, v in pairs(tbl.itemWhitelist) do itemWhitelist[k] = v end
+    end
+    if tbl.itemBlacklist then
+        for k, v in pairs(tbl.itemBlacklist) do itemBlacklist[k] = v end
+    end
+end
+
+local function getConfigList()
+    local list = {}
+    pcall(function()
+        ensureDirs()
+        for _, file in ipairs(listfiles(CONFIG_DIR)) do
+            local name = file:match("([^/\\]+)%.json$")
+            if name and name ~= "autoload" then
+                table.insert(list, name)
+            end
+        end
+    end)
+    return list
+end
+
+updateConfigList = function()
+    local list = getConfigList()
+    if configDropdown then
+        pcall(function() configDropdown:Refresh(list, true) end)
+    end
+end
+
+local function saveConfig(name)
+    ensureDirs()
+    local ok, err = pcall(function()
+        writefile(CONFIG_DIR .. name .. ".json", HttpService:JSONEncode(getSettingsTable()))
+    end)
+    if ok then
+        notify("Config Saved", name .. ".json", Color3.fromRGB(60, 200, 120))
+    else
+        notify("Save Failed", tostring(err), Color3.fromRGB(255, 80, 80))
+    end
+    updateConfigList()
+end
+
+local function loadConfig(name)
+    local ok, data = pcall(function()
+        return HttpService:JSONDecode(readfile(CONFIG_DIR .. name .. ".json"))
+    end)
+    if ok and type(data) == "table" then
+        applySettings(data)
+        notify("Config Loaded", name, Color3.fromRGB(100, 160, 255))
+    else
+        notify("Load Failed", "Could not read " .. name, Color3.fromRGB(255, 80, 80))
+    end
+end
+
+local function deleteConfig(name)
+    pcall(function() delfile(CONFIG_DIR .. name .. ".json") end)
+    updateConfigList()
+    notify("Config Deleted", name, Color3.fromRGB(200, 80, 80))
+end
+
+local function setAutoload(name)
+    ensureDirs()
+    pcall(function()
+        writefile(AUTOLOAD_FILE, HttpService:JSONEncode({autoload = name}))
+    end)
+end
+
+local function clearAutoload()
+    pcall(function() delfile(AUTOLOAD_FILE) end)
+end
+
+local function doAutoload()
+    pcall(function()
+        if isfile(AUTOLOAD_FILE) then
+            local data = HttpService:JSONDecode(readfile(AUTOLOAD_FILE))
+            if data and data.autoload then
+                loadConfig(data.autoload)
+            end
+        end
+    end)
+end
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- ── UI Tabs ───────────────────────────────────────────────────────────────────
+-- ══════════════════════════════════════════════════════════════════════════════
+local AutoTab      = Window:MakeTab({Name = "Auto",      Icon = "rbxassetid://7733967807"})
+local FilterTab    = Window:MakeTab({Name = "Filter",    Icon = "rbxassetid://7733967807"})
+local CounterTab   = Window:MakeTab({Name = "Counter",   Icon = "rbxassetid://7733967807"})
+local StatsTab     = Window:MakeTab({Name = "Stats",     Icon = "rbxassetid://7733967807"})
+local ESPTab       = Window:MakeTab({Name = "ESP",       Icon = "rbxassetid://7733967807"})
+local ConfigTab    = Window:MakeTab({Name = "Config",    Icon = "rbxassetid://7733967807"})
+
+-- ── Auto Tab ──────────────────────────────────────────────────────────────────
+AutoTab:AddToggle({Name = "Auto Collect",      Default = false, Callback = function(v) autoCollectEnabled = v end})
+AutoTab:AddToggle({Name = "Teleport",          Default = false, Callback = function(v) teleportEnabled    = v end})
+AutoTab:AddToggle({Name = "Auto Farm Loop",    Default = false, Callback = function(v)
+    autoFarmEnabled = v
+    if v then
+        notify("Auto Farm", "Loop started", Color3.fromRGB(60, 200, 120))
+    end
+end})
+
+AutoTab:AddSlider({
+    Name      = "Teleport Height",
+    Min       = 1, Max = 10, Default = 2.5,
+    Color     = Color3.fromRGB(255, 255, 255),
+    Increment = 0.1,
+    ValueName = "studs up",
+    Callback  = function(v) TELEPORT_HEIGHT = v end
+})
+AutoTab:AddSlider({
+    Name      = "Horizontal Offset",
+    Min       = -5, Max = 5, Default = 0,
+    Color     = Color3.fromRGB(200, 200, 255),
+    Increment = 0.5,
+    ValueName = "studs (right/left)",
+    Callback  = function(v) HORIZONTAL_OFFSET = v end
+})
+AutoTab:AddSlider({
+    Name      = "Spawn Delay",
+    Min       = 0, Max = 10, Default = 1,
+    Color     = Color3.fromRGB(255, 255, 255),
+    Increment = 0.5,
+    ValueName = "seconds",
+    Callback  = function(v) SPAWN_DELAY = v end
+})
+AutoTab:AddSlider({
+    Name      = "Teleport Cooldown",
+    Min       = 0, Max = 15, Default = 5,
+    Color     = Color3.fromRGB(255, 255, 255),
+    Increment = 0.5,
+    ValueName = "seconds",
+    Callback  = function(v) TELEPORT_COOLDOWN = v end
+})
+AutoTab:AddSlider({
+    Name      = "Farm Loop Interval",
+    Min       = 0.1, Max = 5, Default = 0.5,
+    Color     = Color3.fromRGB(150, 255, 200),
+    Increment = 0.1,
+    ValueName = "seconds",
+    Callback  = function(v) AUTO_FARM_INTERVAL = v end
+})
+AutoTab:AddSlider({
+    Name      = "Max Collect Distance",
+    Min       = 0, Max = 500, Default = 200,
+    Color     = Color3.fromRGB(255, 200, 100),
+    Increment = 10,
+    ValueName = "studs (0 = unlimited)",
+    Callback  = function(v) MAX_COLLECT_DIST = v end
 })
 
-ESPTab:AddColorpicker({
-    Name = "Outline Color",
-    Default = Color3.fromRGB(255,255,255),
-    Callback = function(Value) espOutlineColor = toColor3(Value) end
+-- ── Filter Tab ────────────────────────────────────────────────────────────────
+FilterTab:AddLabel("Item Whitelist  (enable = collect this item)")
+for _, name in ipairs(trackedItems) do
+    local n = name
+    FilterTab:AddToggle({
+        Name     = n,
+        Default  = true,
+        Callback = function(v)
+            itemWhitelist[n] = v
+        end
+    })
+end
+
+FilterTab:AddLabel("Blacklist Overrides (disables even if whitelisted)")
+for _, name in ipairs(trackedItems) do
+    local n = name
+    FilterTab:AddToggle({
+        Name     = "Block: " .. n,
+        Default  = false,
+        Callback = function(v)
+            itemBlacklist[n] = v
+        end
+    })
+end
+
+-- ── Counter Tab ───────────────────────────────────────────────────────────────
+for _, name in ipairs(trackedItems) do
+    counterLabels[name] = CounterTab:AddLabel(name .. ": 0")
+end
+
+-- ── Stats Tab ─────────────────────────────────────────────────────────────────
+statsTimeLabel  = StatsTab:AddLabel("Session Time: 00:00")
+statsTotalLabel = StatsTab:AddLabel("Total Collected: 0")
+statsRateLabel  = StatsTab:AddLabel("Items/min: 0.0")
+
+StatsTab:AddButton({
+    Name     = "Reset Session Stats",
+    Callback = function()
+        sessionStart   = tick()
+        totalCollected = 0
+        for name in pairs(collectedCounts) do
+            collectedCounts[name] = 0
+            updateCounter(name)
+        end
+        updateStats()
+        notify("Stats Reset", "Session data cleared", Color3.fromRGB(200, 200, 60))
+    end
 })
 
-ESPTab:AddToggle({
-    Name = "Show Item Name",
-    Default = false,
-    Callback = function(Value) showItemName = Value end
+-- ── ESP Tab ───────────────────────────────────────────────────────────────────
+ESPTab:AddToggle({Name = "Enabled",         Default = false,                  Callback = function(v) espEnabled    = v end})
+ESPTab:AddColorpicker({Name = "Default Outline Color", Default = Color3.fromRGB(255,255,255), Callback = function(v) espOutlineColor = toColor3(v) end})
+ESPTab:AddToggle({Name = "Show Item Name",  Default = false,                  Callback = function(v) showItemName  = v end})
+ESPTab:AddColorpicker({Name = "Name Color", Default = Color3.new(1,1,1),      Callback = function(v) espTextColor  = toColor3(v) end})
+ESPTab:AddToggle({Name = "Show Distance",   Default = false,                  Callback = function(v) showDistance  = v end})
+ESPTab:AddLabel("Note: ESP box color uses per-item rarity colors when set")
+
+-- ── Config Tab ────────────────────────────────────────────────────────────────
+uiKeyLabel   = ConfigTab:AddLabel("UI Toggle Key: Z")
+panicKeyLabel = ConfigTab:AddLabel("Panic Key: P")
+
+ConfigTab:AddButton({
+    Name     = "Set UI Toggle Key",
+    Callback = function()
+        waitingForKey = true
+        uiKeyLabel:Set("Press any key…")
+    end
 })
 
-ESPTab:AddColorpicker({
-    Name = "Name Color",
-    Default = Color3.new(1,1,1),
-    Callback = function(Value) espTextColor = toColor3(Value) end
+ConfigTab:AddButton({
+    Name     = "Set Panic Key",
+    Callback = function()
+        waitingForPanicKey = true
+        panicKeyLabel:Set("Press any key…")
+    end
 })
 
--- ── Finalize ──────────────────────
+ConfigTab:AddToggle({
+    Name     = "Disable 3D Rendering",
+    Default  = false,
+    Callback = function(v)
+        disable3DRendering = v
+        set3DRendering(not v)
+    end
+})
+
+ConfigTab:AddButton({
+    Name     = "Reset Counters",
+    Callback = function()
+        for name in pairs(collectedCounts) do
+            collectedCounts[name] = 0
+            updateCounter(name)
+        end
+        totalCollected = 0
+        updateStats()
+    end
+})
+
+local currentConfigName = "default"
+
+ConfigTab:AddTextbox({
+    Name          = "Config Name",
+    Default       = "default",
+    TextDisappear = false,
+    Callback      = function(value)
+        if value ~= "" then currentConfigName = value end
+    end
+})
+
+ConfigTab:AddButton({
+    Name     = "Save (Timestamped)",
+    Callback = function()
+        local t  = os.date and os.date("*t") or {year=0,month=0,day=0,hour=0,min=0}
+        local ts = string.format("%04d%02d%02d_%02d%02d", t.year, t.month, t.day, t.hour, t.min)
+        saveConfig("config_" .. ts)
+    end
+})
+
+ConfigTab:AddButton({Name = "Save Config",   Callback = function() if currentConfigName ~= "" then saveConfig(currentConfigName)   end end})
+ConfigTab:AddButton({Name = "Load Config",   Callback = function() if currentConfigName ~= "" then loadConfig(currentConfigName)   end end})
+ConfigTab:AddButton({Name = "Delete Config", Callback = function() if currentConfigName ~= "" then deleteConfig(currentConfigName) end end})
+
+ConfigTab:AddToggle({
+    Name     = "Autoload This Config on Start",
+    Default  = false,
+    Callback = function(v)
+        if v then setAutoload(currentConfigName) else clearAutoload() end
+    end
+})
+
+configDropdown = ConfigTab:AddDropdown({
+    Name     = "Saved Configs",
+    Default  = "",
+    Options  = getConfigList(),
+    Callback = function(value)
+        if value ~= "" then currentConfigName = value end
+    end
+})
+
+updateConfigList()
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- ── Finalize ──────────────────────────────────────────────────────────────────
+-- ══════════════════════════════════════════════════════════════════════════════
 OrionLib:Init()
 
--- ESP render loop
-RunService.RenderStepped:Connect(updateESP)
+-- Cache the Orion ScreenGui immediately after Init (it now exists)
+findMainGui()
+
+task.defer(doAutoload)
+
+-- Welcome notification
+task.delay(1, function()
+    notify(
+        "✦ Dropped Items Helper",
+        "Enhanced Edition loaded  |  Panic: " .. panicKey.Name,
+        Color3.fromRGB(100, 180, 255)
+    )
+end)
